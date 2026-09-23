@@ -1317,7 +1317,7 @@ function renderDashboardHTML() {
         const res = await fetch('/api/stats');
         const data = await res.json();
         
-        // Menampilkan Auto-scale bytes (B -> KB -> MB -> GB)
+        // Auto-scaled Bytes
         document.getElementById('udp_bytes_in').innerText = data.udp.bytesInDisplay;
         document.getElementById('udp_bytes_out').innerText = data.udp.bytesOutDisplay;
         document.getElementById('udp_pkt_in').innerText = data.udp.packetsIn + ' pkt';
@@ -1804,7 +1804,7 @@ function setupConnectionHandler(clientSocket) {
 
       isFirstPacket = false;
 
-      // 2. HTTPS CONNECT PROXY
+      // 2. HTTPS CONNECT PROXY (DILENGKAPI SNI SNIFFER)
       if (chunkStr.startsWith('CONNECT ')) {
         if (!checkHttpAuth(chunkStr)) {
           const authReq = 'HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="Proxy Auth"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n';
@@ -1817,16 +1817,30 @@ function setupConnectionHandler(clientSocket) {
           const targetHost = match[1];
           const targetPort = parseInt(match[2], 10) || 443;
 
-          connData.type = 'HTTPS TUNNEL';
-          connData.target = `${targetHost}:${targetPort}`;
-          activeConnections.set(connId, connData);
+          if (!targetHost.includes('railway.com') && !targetHost.includes('up.railway.app')) {
+            connData.type = 'HTTPS TUNNEL';
+            connData.target = `${targetHost}:${targetPort}`;
+            activeConnections.set(connId, connData);
+          }
 
           const resolvedIp = await resolveDomain(targetHost);
           targetSocket = net.connect({ host: resolvedIp, port: targetPort, noDelay: true }, () => {
             targetSocket.setNoDelay(true);
             targetSocket.setKeepAlive(true, 5000);
             clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-            bridgeSockets(clientSocket, targetSocket);
+
+            // Tangkap paket TLS Client Hello pertama untuk ekstrak nama domain asli (SNI)
+            clientSocket.once('data', (tlsChunk) => {
+              const extractedSni = parseTlsSni(tlsChunk);
+              if (extractedSni) {
+                connData.target = `${extractedSni}:${targetPort}`;
+                activeConnections.set(connId, connData);
+              }
+              if (!targetSocket.destroyed) {
+                targetSocket.write(tlsChunk);
+              }
+              bridgeSockets(clientSocket, targetSocket);
+            });
           });
 
           targetSocket.on('error', () => { activeConnections.delete(connId); clientSocket.destroy(); });
