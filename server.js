@@ -41,22 +41,23 @@ let RAW_TCP_CONFIG = {
   defaultTargetPort: 443
 };
 
+// Default langsung di-set ke Cloudflare UDP untuk latensi terendah
 let DNS_CONFIG = {
-  mode: 'DOH',
-  activeName: 'Cloudflare DoH (Official)',
+  mode: 'UDP',
+  activeName: 'Cloudflare UDP (1.1.1.1:53)',
   dohUrl: 'https://cloudflare-dns.com/dns-query',
   udpServer: '1.1.1.1',
   udpPort: 53
 };
 
 const PRESETS = {
+  'cf-udp': { name: 'Cloudflare UDP 1.1.1.1:53 (Paling Cepat)', type: 'UDP', host: '1.1.1.1', port: 53 },
+  'google-udp': { name: 'Google UDP 8.8.8.8:53 (Bagus YouTube)', type: 'UDP', host: '8.8.8.8', port: 53 },
   'cf-doh': { name: 'Cloudflare DoH (Official)', type: 'DOH', url: 'https://cloudflare-dns.com/dns-query' },
   'google-doh': { name: 'Google DoH', type: 'DOH', url: 'https://dns.google/dns-query' },
+  'quad9-udp': { name: 'Quad9 UDP (9.9.9.9:53)', type: 'UDP', host: '9.9.9.9', port: 53 },
   'quad9-doh': { name: 'Quad9 DoH (Security)', type: 'DOH', url: 'https://dns.quad9.net/dns-query' },
-  'adguard-doh': { name: 'AdGuard DoH (Adblock)', type: 'DOH', url: 'https://dns.adguard-dns.com/dns-query' },
-  'cf-udp': { name: 'Cloudflare UDP (1.1.1.1:53)', type: 'UDP', host: '1.1.1.1', port: 53 },
-  'google-udp': { name: 'Google UDP (8.8.8.8:53)', type: 'UDP', host: '8.8.8.8', port: 53 },
-  'quad9-udp': { name: 'Quad9 UDP (9.9.9.9:53)', type: 'UDP', host: '9.9.9.9', port: 53 }
+  'adguard-doh': { name: 'AdGuard DoH (Adblock)', type: 'DOH', url: 'https://dns.adguard-dns.com/dns-query' }
 };
 
 function loadData() {
@@ -128,11 +129,11 @@ const dnsCache = new Map();
 const UDP_CONFIG = Object.freeze({
   LISTEN_HOST: '0.0.0.0',
   WS_PATH: '/',
-  MAX_WS_MESSAGE_BYTES: 4 * 1024 * 1024,
+  MAX_WS_MESSAGE_BYTES: 8 * 1024 * 1024,
   HANDSHAKE_TIMEOUT_MS: 10000,
   IDLE_TIMEOUT_MS: 300000,
   XUDP_GRACE_MS: 60000,
-  MAX_CONNECTIONS: 4096,
+  MAX_CONNECTIONS: 8192,
   REJECT_UDP_443: false,
 });
 
@@ -153,7 +154,7 @@ function addUdpLog(msg) {
 }
 
 // ==========================================
-// 3. FORMATTER & DNS RESOLVER
+// 3. OPTIMIZED FORMATTER & DNS RESOLVER
 // ==========================================
 function formatDynamicBytes(bytes) {
   if (!bytes || bytes === 0) return '0 B';
@@ -167,28 +168,9 @@ function formatDynamicBytes(bytes) {
 async function resolveDomain(hostname) {
   const now = Date.now();
   const cached = dnsCache.get(hostname);
-  if (cached && (now - cached.time < 1000 * 60 * 10)) return cached.ip;
+  // Cache dipertahankan selama 1 jam untuk mencegah jeda resolve berulang
+  if (cached && (now - cached.time < 1000 * 60 * 60)) return cached.ip;
   if (/^(\d{1,3}\.){3}\d{1,3}$/.test(hostname)) return hostname;
-
-  if (DNS_CONFIG.mode === 'DOH') {
-    try {
-      const url = new URL(DNS_CONFIG.dohUrl);
-      url.searchParams.set('name', hostname);
-      url.searchParams.set('type', 'A');
-      const res = await fetch(url.toString(), {
-        headers: { 'Accept': 'application/dns-json' },
-        signal: AbortSignal.timeout(1800)
-      });
-      const data = await res.json();
-      if (data.Answer && data.Answer.length > 0) {
-        const aRecord = data.Answer.find(ans => ans.type === 1);
-        if (aRecord && aRecord.data) {
-          dnsCache.set(hostname, { ip: aRecord.data, time: now });
-          return aRecord.data;
-        }
-      }
-    } catch (_) {}
-  }
 
   if (DNS_CONFIG.mode === 'UDP' && DNS_CONFIG.udpServer) {
     try {
@@ -202,6 +184,26 @@ async function resolveDomain(hostname) {
           } else reject(err);
         });
       });
+    } catch (_) {}
+  }
+
+  if (DNS_CONFIG.mode === 'DOH') {
+    try {
+      const url = new URL(DNS_CONFIG.dohUrl);
+      url.searchParams.set('name', hostname);
+      url.searchParams.set('type', 'A');
+      const res = await fetch(url.toString(), {
+        headers: { 'Accept': 'application/dns-json' },
+        signal: AbortSignal.timeout(1500)
+      });
+      const data = await res.json();
+      if (data.Answer && data.Answer.length > 0) {
+        const aRecord = data.Answer.find(ans => ans.type === 1);
+        if (aRecord && aRecord.data) {
+          dnsCache.set(hostname, { ip: aRecord.data, time: now });
+          return aRecord.data;
+        }
+      }
     } catch (_) {}
   }
 
@@ -265,7 +267,7 @@ function parseRequestBody(raw) {
 }
 
 // ==========================================
-// 4. UDP RELAY (XUDP PROTOCOL ENGINE)
+// 4. UDP RELAY ENGINE (HIGH-BUFFER OPTIMIZED)
 // ==========================================
 const RELAY_MAGIC = Buffer.from('VLRLY004', 'ascii');
 const RELAY_MODE_FIXED_UDP = 0x01;
@@ -522,12 +524,25 @@ class UDPAssociation {
   }
   static async create() {
     const assoc = new UDPAssociation();
-    assoc.udp4 = dgram.createSocket({ type: 'udp4', reuseAddr: true });
+    // Socket UDP dengan buffer 4MB untuk kecepatan transfer tinggi
+    assoc.udp4 = dgram.createSocket({ 
+      type: 'udp4', 
+      reuseAddr: true,
+      recvBufferSize: 4 * 1024 * 1024,
+      sendBufferSize: 4 * 1024 * 1024
+    });
     await bindDgram(assoc.udp4, 0, '0.0.0.0');
     assoc.port = assoc.udp4.address().port;
     assoc.udp4.on('message', (msg, rinfo) => assoc._onMessage(msg, rinfo));
     assoc.udp4.on('error', () => {});
-    assoc.udp6 = dgram.createSocket({ type: 'udp6', reuseAddr: true, ipv6Only: true });
+    
+    assoc.udp6 = dgram.createSocket({ 
+      type: 'udp6', 
+      reuseAddr: true, 
+      ipv6Only: true,
+      recvBufferSize: 4 * 1024 * 1024,
+      sendBufferSize: 4 * 1024 * 1024
+    });
     try {
       await bindDgram(assoc.udp6, assoc.port, '::');
       assoc.udp6.on('message', (msg, rinfo) => assoc._onMessage(msg, rinfo));
@@ -1192,7 +1207,6 @@ function renderDashboardHTML() {
   <div class="card">
     <h2>⚡ DUAL SERVICE CONTROLLER</h2>
 
-    <!-- ENDPOINT 1: UDP RELAY -->
     <div class="endpoint-box" style="border-color:#38bdf8;">
       <div>
         <div class="endpoint-title">🚀 UDP Relay WSS Endpoint (Port 443)</div>
@@ -1201,7 +1215,6 @@ function renderDashboardHTML() {
       <button class="btn-copy" onclick="navigator.clipboard.writeText(document.getElementById('udp_url').innerText)">📋 SALIN</button>
     </div>
 
-    <!-- ENDPOINT 2: TCP PROXY -->
     <div class="endpoint-box" style="border-color:#a855f7;">
       <div>
         <div class="endpoint-title" style="color:#c084fc;">🛠️ Multi-Proxy Endpoint (TCP Port)</div>
@@ -1210,7 +1223,6 @@ function renderDashboardHTML() {
       <button class="btn-copy" style="border-color:#c084fc; color:#c084fc;" onclick="navigator.clipboard.writeText(document.getElementById('proxy_tcp_url').innerText)">📋 SALIN</button>
     </div>
 
-    <!-- METRICS AUTO-SCALING -->
     <div class="badge-grid">
       <div class="badge" style="border-color:#38bdf8;">
         <h4>UDP In / Recv</h4>
@@ -1245,20 +1257,18 @@ function renderDashboardHTML() {
       </div>
     </div>
 
-    <!-- PANEL 1: LOGS UDP RELAY -->
     <div class="panel" style="border-color:#38bdf8;">
       <div class="section-title" style="margin:0; color:#38bdf8;">📡 REAL-TIME UDP RELAY LOGS</div>
       <div class="log-box" id="udp_log_box" style="margin-top:6px;">Menunggu aktivitas paket UDP...</div>
     </div>
 
-    <!-- PANEL 2: PROXY DNS CONFIG -->
     <div class="panel" style="border-color:#38bdf8;">
       <div class="section-title" style="margin:0; color:#38bdf8;">🌐 PENGATURAN DNS RESOLVER</div>
       <select id="preset_select" onchange="applyPresetUI()">
+        <option value="cf-udp" ${DNS_CONFIG.mode === 'UDP' && DNS_CONFIG.udpServer === '1.1.1.1' ? 'selected' : ''}>🚀 Cloudflare UDP 1.1.1.1:53 (Paling Cepat)</option>
+        <option value="google-udp" ${DNS_CONFIG.mode === 'UDP' && DNS_CONFIG.udpServer === '8.8.8.8' ? 'selected' : ''}>🚀 Google UDP 8.8.8.8:53 (Bagus YouTube)</option>
         <option value="cf-doh" ${DNS_CONFIG.mode === 'DOH' && DNS_CONFIG.dohUrl.includes('cloudflare') ? 'selected' : ''}>⚡ Cloudflare DoH (Official)</option>
         <option value="google-doh" ${DNS_CONFIG.mode === 'DOH' && DNS_CONFIG.dohUrl.includes('google') ? 'selected' : ''}>⚡ Google DoH (Official)</option>
-        <option value="cf-udp" ${DNS_CONFIG.mode === 'UDP' && DNS_CONFIG.udpServer === '1.1.1.1' ? 'selected' : ''}>🚀 Cloudflare UDP 1.1.1.1:53</option>
-        <option value="google-udp" ${DNS_CONFIG.mode === 'UDP' && DNS_CONFIG.udpServer === '8.8.8.8' ? 'selected' : ''}>🚀 Google UDP 8.8.8.8:53</option>
         <option value="quad9-udp" ${DNS_CONFIG.mode === 'UDP' && DNS_CONFIG.udpServer === '9.9.9.9' ? 'selected' : ''}>🛡️ Quad9 UDP 9.9.9.9:53</option>
         <option value="quad9-doh">🛡️ Quad9 DoH (Security)</option>
         <option value="adguard-doh">🛑 AdGuard DoH (Adblock)</option>
@@ -1275,7 +1285,6 @@ function renderDashboardHTML() {
       <button style="background:#38bdf8;" onclick="saveDns()">💾 TERAPKAN DNS</button>
     </div>
 
-    <!-- PANEL 3: RAW TCP CONTROLLER -->
     <div class="panel" style="border-color:#a855f7;">
       <div class="section-title" style="margin:0; color:#c084fc;">🛠️ KONTROL PROXY RAW TCP</div>
       <select id="raw_tcp_switch">
@@ -1287,7 +1296,6 @@ function renderDashboardHTML() {
       <button style="background:#a855f7; color:#fff;" onclick="saveRawTcp()">💾 SIMPAN PENGATURAN RAW TCP</button>
     </div>
 
-    <!-- PANEL 4: AUTHENTICATION & USERS -->
     <div class="panel">
       <div class="section-title" style="margin:0;">👤 USER & PASSWORD PROXY</div>
       <div style="margin-top:8px;">
@@ -1306,7 +1314,6 @@ function renderDashboardHTML() {
       <button onclick="addUser()">+ TAMBAH USER PROXY</button>
     </div>
 
-    <!-- LIVE CONNECTIONS -->
     <div class="section-title">🟢 LIVE CONNECTIONS (REAL-TIME)</div>
     <div class="conn-list" id="proxy_conn_container"></div>
   </div>
@@ -1317,7 +1324,6 @@ function renderDashboardHTML() {
         const res = await fetch('/api/stats');
         const data = await res.json();
         
-        // Auto-scaled Bytes
         document.getElementById('udp_bytes_in').innerText = data.udp.bytesInDisplay;
         document.getElementById('udp_bytes_out').innerText = data.udp.bytesOutDisplay;
         document.getElementById('udp_pkt_in').innerText = data.udp.packetsIn + ' pkt';
@@ -1453,9 +1459,10 @@ function renderDashboardHTML() {
 }
 
 // ==========================================
-// 6. CORE MULTIPLEXER (NET SOCKET HANDLER)
+// 6. CORE MULTIPLEXER (HIGH-SPEED SOCKET ENGINE)
 // ==========================================
 function setupConnectionHandler(clientSocket) {
+  // Matikan Nagle Algorithm dan optimasi buffer
   clientSocket.setNoDelay(true);
   clientSocket.setKeepAlive(true, 5000);
   clientSocket.setMaxListeners(0);
@@ -1481,6 +1488,12 @@ function setupConnectionHandler(clientSocket) {
   let httpBuffer = '';
 
   const bridgeSockets = (sockA, sockB) => {
+    if (sockA.setNoDelay) sockA.setNoDelay(true);
+    if (sockB.setNoDelay) sockB.setNoDelay(true);
+
+    sockA.pipe(sockB, { end: true });
+    sockB.pipe(sockA, { end: true });
+
     sockA.on('data', (d) => {
       connData.bytesIn += d.length;
       proxyBytesIn += d.length;
@@ -1489,9 +1502,6 @@ function setupConnectionHandler(clientSocket) {
       connData.bytesOut += d.length;
       proxyBytesOut += d.length;
     });
-
-    sockA.pipe(sockB, { end: true });
-    sockB.pipe(sockA, { end: true });
 
     const cleanup = () => {
       activeConnections.delete(connId);
@@ -1763,7 +1773,7 @@ function setupConnectionHandler(clientSocket) {
           return;
         }
 
-        // DASHBOARD WEB UI: Bebas Bad Gateway
+        // DASHBOARD WEB UI
         const hostHeaderMatch = dataStr.match(/Host:\s*([^\r\n:]+)/i);
         const reqHost = hostHeaderMatch ? hostHeaderMatch[1].trim() : '';
         const isInternalHost = reqHost.includes('railway.app') || reqHost.includes('railway.com') || reqHost.includes('localhost') || reqHost.includes('127.0.0.1');
@@ -1804,7 +1814,7 @@ function setupConnectionHandler(clientSocket) {
 
       isFirstPacket = false;
 
-      // 2. HTTPS CONNECT PROXY (DILENGKAPI SNI SNIFFER)
+      // 2. HTTPS CONNECT PROXY (SNI SNIFFER AKTIF)
       if (chunkStr.startsWith('CONNECT ')) {
         if (!checkHttpAuth(chunkStr)) {
           const authReq = 'HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="Proxy Auth"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n';
@@ -1829,7 +1839,7 @@ function setupConnectionHandler(clientSocket) {
             targetSocket.setKeepAlive(true, 5000);
             clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
 
-            // Tangkap paket TLS Client Hello pertama untuk ekstrak nama domain asli (SNI)
+            // Intip paket TLS Client Hello untuk ekstrak domain asli
             clientSocket.once('data', (tlsChunk) => {
               const extractedSni = parseTlsSni(tlsChunk);
               if (extractedSni) {
