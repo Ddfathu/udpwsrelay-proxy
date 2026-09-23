@@ -12,10 +12,16 @@ const { createHash } = require('node:crypto');
 const { EventEmitter } = require('node:events');
 
 // ==========================================
-// 1. ENVIRONMENT & STORAGE CONFIGURATION
+// 1. CONFIGURATION & ANTI-PORT COLLISION
 // ==========================================
 const UDP_PORT = parseInt(process.env.PORT, 10) || 8080;
-const PROXY_PORT = parseInt(process.env.PROXY_PORT, 10) || 8081;
+
+// Proteksi port bentrok: jika PROXY_PORT tidak diset atau sama dengan UDP_PORT, geser otomatis ke port berikutnya
+let parsedProxyPort = parseInt(process.env.PROXY_PORT || process.env.RAILWAY_TCP_APPLICATION_PORT, 10) || 8081;
+if (parsedProxyPort === UDP_PORT) {
+  parsedProxyPort = UDP_PORT + 1;
+}
+const PROXY_PORT = parsedProxyPort;
 
 const RAILWAY_PUBLIC_DOMAIN = process.env.RAILWAY_PUBLIC_DOMAIN || '';
 const TCP_DOMAIN = process.env.RAILWAY_TCP_PROXY_DOMAIN || '';
@@ -27,7 +33,7 @@ const UDP_ENDPOINT_URL = RAILWAY_PUBLIC_DOMAIN
   : `ws://127.0.0.1:${UDP_PORT}`;
 
 // ==========================================
-// 2. SCRIPT 1 STATE & DATABASE (FULL)
+// 2. PROXY STATE & DATABASE
 // ==========================================
 const proxyUsers = new Map();
 let PROXY_AUTH_MODE = 'NONE';
@@ -70,7 +76,7 @@ function loadData() {
       }
     }
   } catch (err) {
-    console.error('[Storage Error] Failed to read database:', err.message);
+    console.error('[Storage Error] Gagal baca database:', err.message);
   }
 }
 
@@ -84,7 +90,7 @@ function saveData() {
     };
     fs.writeFileSync(DB_PATH, JSON.stringify(payload, null, 2), 'utf-8');
   } catch (err) {
-    console.error('[Storage Error] Failed to save database:', err.message);
+    console.error('[Storage Error] Gagal simpan database:', err.message);
   }
 }
 
@@ -229,7 +235,7 @@ function formatBytes(bytes) {
 }
 
 // ==========================================
-// 3. SCRIPT 2 LOGIC (UDP RELAY / XUDP FULL)
+// 3. UDP RELAY / XUDP CORE
 // ==========================================
 const UDP_CONFIG = Object.freeze({
   LISTEN_HOST: '0.0.0.0',
@@ -1166,7 +1172,7 @@ async function handleConnectionUDP(socket, cfg, xm) {
 }
 
 // ==========================================
-// 4. MASTER DASHBOARD HTML (LENGKAP SEMUA FITUR)
+// 4. UNIFIED DASHBOARD HTML
 // ==========================================
 function renderMasterDashboardHTML() {
   return `<!DOCTYPE html>
@@ -1219,13 +1225,13 @@ function renderMasterDashboardHTML() {
     <!-- ENDPOINT 2: TCP PROXY -->
     <div class="endpoint-box" style="border-color:#a855f7;">
       <div>
-        <div class="endpoint-title" style="color:#c084fc;">🛠️ Multi-Proxy Endpoint (TCP Port 8081)</div>
+        <div class="endpoint-title" style="color:#c084fc;">🛠️ Multi-Proxy Endpoint (TCP Port ${PROXY_PORT})</div>
         <div class="endpoint-val" style="color:#c084fc;" id="proxy_tcp_url">${PROXY_SERVER_INFO.fullProxy || 'Loading...'}</div>
       </div>
       <button class="btn-copy" style="border-color:#c084fc; color:#c084fc;" onclick="navigator.clipboard.writeText(document.getElementById('proxy_tcp_url').innerText)">📋 SALIN</button>
     </div>
 
-    <!-- USAGE METRICS IN GB -->
+    <!-- USAGE STATS IN GB -->
     <div class="badge-grid">
       <div class="badge" style="border-color:#38bdf8;">
         <h4>UDP In / Recv</h4>
@@ -1255,18 +1261,18 @@ function renderMasterDashboardHTML() {
         <div class="val" style="color:#39ff14;" id="combined_active">0 / 0</div>
       </div>
       <div class="badge">
-        <h4>DNS Resolver Status</h4>
+        <h4>DNS Resolver Mode</h4>
         <div class="val" style="color:#38bdf8; font-size:0.95rem;" id="badge_dns_mode">${DNS_CONFIG.mode}</div>
       </div>
     </div>
 
-    <!-- PANEL 1: REAL-TIME UDP LOGS -->
+    <!-- PANEL 1: LOGS UDP RELAY -->
     <div class="panel" style="border-color:#38bdf8;">
       <div class="section-title" style="margin:0; color:#38bdf8;">📡 REAL-TIME UDP RELAY LOGS</div>
       <div class="log-box" id="udp_log_box" style="margin-top:6px;">Menunggu aktivitas paket UDP...</div>
     </div>
 
-    <!-- PANEL 2: PROXY DNS CONTROLLER -->
+    <!-- PANEL 2: PROXY DNS CONFIG -->
     <div class="panel" style="border-color:#38bdf8;">
       <div class="section-title" style="margin:0; color:#38bdf8;">🌐 PENGATURAN DNS RESOLVER</div>
       <select id="preset_select" onchange="applyPresetUI()">
@@ -1302,7 +1308,7 @@ function renderMasterDashboardHTML() {
       <button style="background:#a855f7; color:#fff;" onclick="saveRawTcp()">💾 SIMPAN PENGATURAN RAW TCP</button>
     </div>
 
-    <!-- PANEL 4: USER & AUTHENTICATION -->
+    <!-- PANEL 4: AUTHENTICATION & USERS -->
     <div class="panel">
       <div class="section-title" style="margin:0;">👤 USER & PASSWORD PROXY</div>
       <div style="margin-top:8px;">
@@ -1322,7 +1328,7 @@ function renderMasterDashboardHTML() {
     </div>
 
     <!-- LIVE CONNECTIONS -->
-    <div class="section-title">🟢 ACTIVE PROXY CONNECTIONS (PORT 8081)</div>
+    <div class="section-title">🟢 ACTIVE PROXY CONNECTIONS (PORT ${PROXY_PORT})</div>
     <div class="conn-list" id="proxy_conn_container"></div>
   </div>
 
@@ -1477,7 +1483,7 @@ function parseJsonBody(req) {
 }
 
 // ==========================================
-// 5. SERVER PORT 8080 (HTTP / WS / API / UI)
+// 5. SERVER 1: PORT 8080 (HTTP / WS / UI / API)
 // ==========================================
 function startPort8080Server() {
   const xm = new XUDPManager(UDP_CONFIG.XUDP_GRACE_MS);
@@ -1582,7 +1588,7 @@ function startPort8080Server() {
       return res.end(JSON.stringify({ success: true }));
     }
 
-    // Dashboard UI
+    // Serve UI
     if (pathname === '/' || pathname === '/index.html') {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       return res.end(renderMasterDashboardHTML());
@@ -1592,7 +1598,7 @@ function startPort8080Server() {
     res.end('Not Found');
   });
 
-  // WebSocket Upgrade Handler for UDP Relay
+  // Upgrade WebSocket untuk UDP Relay
   server.on('upgrade', (req, raw) => {
     UDP_STATS.totalHandshakes++;
     if (active >= UDP_CONFIG.MAX_CONNECTIONS) {
@@ -1617,14 +1623,19 @@ function startPort8080Server() {
     handleConnectionUDP(ws, UDP_CONFIG, xm).catch(() => ws.destroy());
   });
 
+  server.on('error', (err) => {
+    console.error(`[Fatal UDP/UI Server Error on Port ${UDP_PORT}]:`, err.message);
+    process.exit(1);
+  });
+
   server.listen(UDP_PORT, '0.0.0.0', () => {
-    console.log(`[UDP Relay & UI] Server berjalan di port ${UDP_PORT}`);
+    console.log(`[UDP Relay & UI] Berjalan di port ${UDP_PORT}`);
     addLog(`UDP Relay & Web UI listening di port ${UDP_PORT}`);
   });
 }
 
 // ==========================================
-// 6. SERVER PORT 8081 (MULTI-PROTOCOL PROXY FULL)
+// 6. SERVER 2: PORT 8081 (MULTI-PROTOCOL PROXY ENGINE)
 // ==========================================
 function startPort8081Proxy() {
   const proxyServer = net.createServer({
@@ -1675,7 +1686,7 @@ function startPort8081Proxy() {
       sockB.on('close', cleanup);
     };
 
-    // SOCKS5 Handler Lengkap (Dengan Verifikasi Auth)
+    // SOCKS5 Handler
     const handleSocks5 = async (chunk) => {
       if (socksState === 0) {
         const nmethods = chunk[1];
@@ -1863,8 +1874,12 @@ function startPort8081Proxy() {
     clientSocket.on('close', cleanOnExit);
   });
 
+  proxyServer.on('error', (err) => {
+    console.error(`[Fatal TCP Proxy Error on Port ${PROXY_PORT}]:`, err.message);
+  });
+
   proxyServer.listen(PROXY_PORT, '0.0.0.0', () => {
-    console.log(`[Proxy Server] TCP Multi-Protocol Engine berjalan di port ${PROXY_PORT}`);
+    console.log(`[Proxy Server] TCP Engine berjalan di port ${PROXY_PORT}`);
   });
 }
 
