@@ -11,12 +11,14 @@ const { createHash } = require('node:crypto');
 const { EventEmitter } = require('node:events');
 
 // ==========================================
-// 1. ENVIRONMENT & STORAGE CONFIGURATION
+// 1. ENVIRONMENT & PORT SETTINGS
 // ==========================================
 const MAIN_PORT = parseInt(process.env.PORT, 10) || 8080;
-let rawProxyPort = parseInt(process.env.PROXY_PORT || process.env.RAILWAY_TCP_APPLICATION_PORT, 10) || 8081;
-if (rawProxyPort === MAIN_PORT) rawProxyPort = MAIN_PORT + 1;
-const EXTRA_TCP_PORT = rawProxyPort;
+let parsedProxyPort = parseInt(process.env.PROXY_PORT, 10) || 8081;
+if (parsedProxyPort === MAIN_PORT) {
+  parsedProxyPort = MAIN_PORT === 8080 ? 8081 : 8080;
+}
+const EXTRA_TCP_PORT = parsedProxyPort;
 
 const RAILWAY_PUBLIC_DOMAIN = process.env.RAILWAY_PUBLIC_DOMAIN || '';
 const TCP_DOMAIN = process.env.RAILWAY_TCP_PROXY_DOMAIN || '';
@@ -115,14 +117,14 @@ function updateRailwayProxyIP() {
 updateRailwayProxyIP();
 setInterval(updateRailwayProxyIP, 1000 * 60 * 30);
 
-// Proxy connection tracker
+// Proxy Tracker
 const activeConnections = new Map();
 let connectionIdCounter = 0;
 let proxyBytesIn = 0;
 let proxyBytesOut = 0;
 const dnsCache = new Map();
 
-// UDP Relay state tracker
+// UDP Relay Tracker
 const UDP_CONFIG = Object.freeze({
   LISTEN_HOST: '0.0.0.0',
   WS_PATH: '/',
@@ -151,8 +153,17 @@ function addUdpLog(msg) {
 }
 
 // ==========================================
-// 3. DNS RESOLVER
+// 3. FORMATTER & DNS RESOLVER
 // ==========================================
+function formatDynamicBytes(bytes) {
+  if (!bytes || bytes === 0) return '0 B';
+  const k = 1024;
+  const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  if (i === 0) return bytes + ' B';
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+}
+
 async function resolveDomain(hostname) {
   const now = Date.now();
   const cached = dnsCache.get(hostname);
@@ -220,9 +231,12 @@ function parseTlsSni(buffer) {
     if (buffer[0] !== 0x16) return null;
     let pos = 43;
     if (pos >= buffer.length) return null;
-    pos += 1 + buffer[pos];
-    pos += 2 + buffer.readUInt16BE(pos);
-    pos += 1 + buffer[pos];
+    const sessionIdLen = buffer[pos];
+    pos += 1 + sessionIdLen;
+    const cipherSuitesLen = buffer.readUInt16BE(pos);
+    pos += 2 + cipherSuitesLen;
+    const compMethodsLen = buffer[pos];
+    pos += 1 + compMethodsLen;
     if (pos >= buffer.length) return null;
     const extensionsLen = buffer.readUInt16BE(pos);
     pos += 2;
@@ -248,19 +262,6 @@ function parseRequestBody(raw) {
   const delimiterIndex = raw.indexOf('\r\n\r\n');
   if (delimiterIndex === -1) return {};
   try { return JSON.parse(raw.slice(delimiterIndex + 4)); } catch (_) { return {}; }
-}
-
-function formatBytesToGB(bytes) {
-  if (!bytes || bytes === 0) return '0.000 GB';
-  return (bytes / (1024 * 1024 * 1024)).toFixed(3) + ' GB';
-}
-
-function formatBytes(bytes) {
-  if (!bytes || bytes === 0) return '0 B';
-  const k = 1024;
-  const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
 }
 
 // ==========================================
@@ -402,7 +403,7 @@ function parseEndpointBytes(buffer, offset) {
     const len = buffer[cursor++];
     if (len === 0 || buffer.length - cursor < len) throw new Error('invalid domain length');
     let host;
-    try { host = utf8Fatal.decode(buffer.subarray(cursor, cursor + len)); } catch { throw new Error('invalid domain length'); }
+    try { host = utf8Fatal.decode(buffer.subarray(cursor, cursor + len)); } catch { throw new Error('invalid UTF-8 domain'); }
     return { endpoint: { host, port, atyp }, next: cursor + len };
   }
   if (atyp === ATYP_IPV6) {
@@ -1209,26 +1210,26 @@ function renderDashboardHTML() {
       <button class="btn-copy" style="border-color:#c084fc; color:#c084fc;" onclick="navigator.clipboard.writeText(document.getElementById('proxy_tcp_url').innerText)">📋 SALIN</button>
     </div>
 
-    <!-- METRICS IN GB -->
+    <!-- METRICS AUTO-SCALING -->
     <div class="badge-grid">
       <div class="badge" style="border-color:#38bdf8;">
         <h4>UDP In / Recv</h4>
-        <div class="val" style="color:#38bdf8;" id="udp_gb_in">0.000 GB</div>
+        <div class="val" style="color:#38bdf8;" id="udp_bytes_in">0 B</div>
         <div class="sub-val" id="udp_pkt_in">0 pkt</div>
       </div>
       <div class="badge" style="border-color:#38bdf8;">
         <h4>UDP Out / Sent</h4>
-        <div class="val" style="color:#38bdf8;" id="udp_gb_out">0.000 GB</div>
+        <div class="val" style="color:#38bdf8;" id="udp_bytes_out">0 B</div>
         <div class="sub-val" id="udp_pkt_out">0 pkt</div>
       </div>
       <div class="badge" style="border-color:#00ffcc;">
         <h4>Proxy RX (In)</h4>
-        <div class="val" style="color:#00ffcc;" id="proxy_gb_in">0.000 GB</div>
+        <div class="val" style="color:#00ffcc;" id="proxy_bytes_in">0 B</div>
         <div class="sub-val">HTTP/SOCKS/RAW</div>
       </div>
       <div class="badge" style="border-color:#f59e0b;">
         <h4>Proxy TX (Out)</h4>
-        <div class="val" style="color:#f59e0b;" id="proxy_gb_out">0.000 GB</div>
+        <div class="val" style="color:#f59e0b;" id="proxy_bytes_out">0 B</div>
         <div class="sub-val">HTTP/SOCKS/RAW</div>
       </div>
     </div>
@@ -1316,13 +1317,14 @@ function renderDashboardHTML() {
         const res = await fetch('/api/stats');
         const data = await res.json();
         
-        document.getElementById('udp_gb_in').innerText = data.udp.bytesInGB;
-        document.getElementById('udp_gb_out').innerText = data.udp.bytesOutGB;
+        // Menampilkan Auto-scale bytes (B -> KB -> MB -> GB)
+        document.getElementById('udp_bytes_in').innerText = data.udp.bytesInDisplay;
+        document.getElementById('udp_bytes_out').innerText = data.udp.bytesOutDisplay;
         document.getElementById('udp_pkt_in').innerText = data.udp.packetsIn + ' pkt';
         document.getElementById('udp_pkt_out').innerText = data.udp.packetsOut + ' pkt';
 
-        document.getElementById('proxy_gb_in').innerText = data.proxy.bytesInGB;
-        document.getElementById('proxy_gb_out').innerText = data.proxy.bytesOutGB;
+        document.getElementById('proxy_bytes_in').innerText = data.proxy.bytesInDisplay;
+        document.getElementById('proxy_bytes_out').innerText = data.proxy.bytesOutDisplay;
 
         document.getElementById('combined_active').innerText = data.udp.activeClients + ' / ' + data.proxy.totalActive;
         if (data.proxy.info && data.proxy.info.fullProxy) {
@@ -1618,7 +1620,7 @@ function setupConnectionHandler(clientSocket) {
         const firstLine = dataStr.split('\r\n')[0];
         const pathUrl = firstLine.split(' ')[1] || '/';
 
-        // CEK WEBSOCKET UPGRADE (UNTUK UDP RELAY)
+        // WEBSOCKET UPGRADE UNTUK UDP RELAY
         if (/Upgrade:\s*websocket/i.test(dataStr)) {
           const keyMatch = dataStr.match(/Sec-WebSocket-Key:\s*([^\r\n]+)/i);
           if (keyMatch) {
@@ -1644,7 +1646,6 @@ function setupConnectionHandler(clientSocket) {
               }
             });
 
-            // Sisa buffer jika ada
             const rest = Buffer.from(httpBuffer.slice(headerEnd + 4));
             if (rest.length > 0) ws.feedHead(rest);
 
@@ -1717,7 +1718,7 @@ function setupConnectionHandler(clientSocket) {
           return;
         }
 
-        // API: Unified Realtime Stats
+        // API: Stats Realtime Auto-Scale
         if (pathUrl === '/api/stats') {
           const activeList = Array.from(activeConnections.values())
             .filter(c => !c.target.includes('railway.com') && !c.target.includes('up.railway.app'))
@@ -1727,8 +1728,8 @@ function setupConnectionHandler(clientSocket) {
               type: c.type,
               target: c.target,
               uptime: Math.floor((Date.now() - c.startTime) / 1000),
-              bytesIn: formatBytes(c.bytesIn),
-              bytesOut: formatBytes(c.bytesOut)
+              bytesIn: formatDynamicBytes(c.bytesIn),
+              bytesOut: formatDynamicBytes(c.bytesOut)
             }));
 
           const userObjects = [];
@@ -1740,8 +1741,8 @@ function setupConnectionHandler(clientSocket) {
               totalHandshakes: UDP_STATS.totalHandshakes,
               packetsIn: UDP_STATS.udpPacketsIn,
               packetsOut: UDP_STATS.udpPacketsOut,
-              bytesInGB: formatBytesToGB(UDP_STATS.udpBytesIn),
-              bytesOutGB: formatBytesToGB(UDP_STATS.udpBytesOut),
+              bytesInDisplay: formatDynamicBytes(UDP_STATS.udpBytesIn),
+              bytesOutDisplay: formatDynamicBytes(UDP_STATS.udpBytesOut),
               recentLogs: UDP_STATS.recentLogs
             },
             proxy: {
@@ -1751,8 +1752,8 @@ function setupConnectionHandler(clientSocket) {
               authMode: PROXY_AUTH_MODE,
               userList: userObjects,
               totalActive: activeList.length,
-              bytesInGB: formatBytesToGB(proxyBytesIn),
-              bytesOutGB: formatBytesToGB(proxyBytesOut),
+              bytesInDisplay: formatDynamicBytes(proxyBytesIn),
+              bytesOutDisplay: formatDynamicBytes(proxyBytesOut),
               connections: activeList
             }
           });
@@ -1762,7 +1763,7 @@ function setupConnectionHandler(clientSocket) {
           return;
         }
 
-        // DASHBOARD WEB UI: Layani jika path root ATAU jika request datang dari Railway Domain/Localhost
+        // DASHBOARD WEB UI: Bebas Bad Gateway
         const hostHeaderMatch = dataStr.match(/Host:\s*([^\r\n:]+)/i);
         const reqHost = hostHeaderMatch ? hostHeaderMatch[1].trim() : '';
         const isInternalHost = reqHost.includes('railway.app') || reqHost.includes('railway.com') || reqHost.includes('localhost') || reqHost.includes('127.0.0.1');
@@ -1774,7 +1775,7 @@ function setupConnectionHandler(clientSocket) {
           return;
         }
 
-        // HTTP Forward Proxy biasa
+        // HTTP Forward Proxy
         if (!checkHttpAuth(dataStr)) {
           const authReq = 'HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="Proxy Auth"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n';
           clientSocket.write(authReq);
@@ -1872,7 +1873,6 @@ function setupConnectionHandler(clientSocket) {
 // ==========================================
 // 7. START LISTENERS (PORT 8080 & PORT 8081)
 // ==========================================
-// Server Utama (Port 8080 - Handle Railway HTTP, UI, UDP Relay WS, & Multi Proxy)
 const mainServer = net.createServer({
   noDelay: true,
   allowHalfOpen: false,
@@ -1884,11 +1884,10 @@ mainServer.on('error', (err) => {
 });
 
 mainServer.listen(MAIN_PORT, '0.0.0.0', () => {
-  console.log(`[Unified Server] Berjalan di port ${MAIN_PORT}`);
+  console.log(`[Unified Server] Running on port ${MAIN_PORT}`);
   addUdpLog(`Unified Server running on port ${MAIN_PORT}`);
 });
 
-// Server Cadangan (Port 8081 - Khusus Forwarding TCP Proxy Railway jika diarahkan ke 8081)
 const extraTcpServer = net.createServer({
   noDelay: true,
   allowHalfOpen: false,
@@ -1900,5 +1899,5 @@ extraTcpServer.on('error', (err) => {
 });
 
 extraTcpServer.listen(EXTRA_TCP_PORT, '0.0.0.0', () => {
-  console.log(`[Extra TCP Server] Berjalan di port ${EXTRA_TCP_PORT}`);
+  console.log(`[Extra TCP Server] Running on port ${EXTRA_TCP_PORT}`);
 });
