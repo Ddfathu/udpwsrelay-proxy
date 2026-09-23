@@ -5,23 +5,18 @@ const net = require('node:net');
 const dgram = require('node:dgram');
 const dnsPromises = require('node:dns').promises;
 const dns = require('node:dns');
-const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const { createHash } = require('node:crypto');
 const { EventEmitter } = require('node:events');
 
 // ==========================================
-// 1. CONFIGURATION & ANTI-PORT COLLISION
+// 1. ENVIRONMENT & STORAGE CONFIGURATION
 // ==========================================
-const UDP_PORT = parseInt(process.env.PORT, 10) || 8080;
-
-// Proteksi port bentrok: jika PROXY_PORT tidak diset atau sama dengan UDP_PORT, geser otomatis ke port berikutnya
-let parsedProxyPort = parseInt(process.env.PROXY_PORT || process.env.RAILWAY_TCP_APPLICATION_PORT, 10) || 8081;
-if (parsedProxyPort === UDP_PORT) {
-  parsedProxyPort = UDP_PORT + 1;
-}
-const PROXY_PORT = parsedProxyPort;
+const MAIN_PORT = parseInt(process.env.PORT, 10) || 8080;
+let rawProxyPort = parseInt(process.env.PROXY_PORT || process.env.RAILWAY_TCP_APPLICATION_PORT, 10) || 8081;
+if (rawProxyPort === MAIN_PORT) rawProxyPort = MAIN_PORT + 1;
+const EXTRA_TCP_PORT = rawProxyPort;
 
 const RAILWAY_PUBLIC_DOMAIN = process.env.RAILWAY_PUBLIC_DOMAIN || '';
 const TCP_DOMAIN = process.env.RAILWAY_TCP_PROXY_DOMAIN || '';
@@ -30,10 +25,10 @@ const DB_PATH = path.resolve(process.env.DATA_DIR || './', 'proxy_data.json');
 
 const UDP_ENDPOINT_URL = RAILWAY_PUBLIC_DOMAIN 
   ? `wss://${RAILWAY_PUBLIC_DOMAIN}:443` 
-  : `ws://127.0.0.1:${UDP_PORT}`;
+  : `ws://127.0.0.1:${MAIN_PORT}`;
 
 // ==========================================
-// 2. PROXY STATE & DATABASE
+// 2. STATE & CONFIGURATION
 // ==========================================
 const proxyUsers = new Map();
 let PROXY_AUTH_MODE = 'NONE';
@@ -76,7 +71,7 @@ function loadData() {
       }
     }
   } catch (err) {
-    console.error('[Storage Error] Gagal baca database:', err.message);
+    console.error('[Storage Error] Failed to read database:', err.message);
   }
 }
 
@@ -90,10 +85,9 @@ function saveData() {
     };
     fs.writeFileSync(DB_PATH, JSON.stringify(payload, null, 2), 'utf-8');
   } catch (err) {
-    console.error('[Storage Error] Gagal simpan database:', err.message);
+    console.error('[Storage Error] Failed to save database:', err.message);
   }
 }
-
 loadData();
 
 let PROXY_SERVER_INFO = {
@@ -115,18 +109,50 @@ function updateRailwayProxyIP() {
       }
     });
   } else {
-    PROXY_SERVER_INFO.fullProxy = `127.0.0.1:${PROXY_PORT}`;
+    PROXY_SERVER_INFO.fullProxy = `TCP Proxy Not Set`;
   }
 }
 updateRailwayProxyIP();
 setInterval(updateRailwayProxyIP, 1000 * 60 * 30);
 
+// Proxy connection tracker
 const activeConnections = new Map();
 let connectionIdCounter = 0;
 let proxyBytesIn = 0;
 let proxyBytesOut = 0;
 const dnsCache = new Map();
 
+// UDP Relay state tracker
+const UDP_CONFIG = Object.freeze({
+  LISTEN_HOST: '0.0.0.0',
+  WS_PATH: '/',
+  MAX_WS_MESSAGE_BYTES: 4 * 1024 * 1024,
+  HANDSHAKE_TIMEOUT_MS: 10000,
+  IDLE_TIMEOUT_MS: 300000,
+  XUDP_GRACE_MS: 60000,
+  MAX_CONNECTIONS: 4096,
+  REJECT_UDP_443: false,
+});
+
+const UDP_STATS = {
+  activeClients: 0,
+  totalHandshakes: 0,
+  udpPacketsOut: 0,
+  udpBytesOut: 0,
+  udpPacketsIn: 0,
+  udpBytesIn: 0,
+  recentLogs: []
+};
+
+function addUdpLog(msg) {
+  const time = new Date().toLocaleTimeString('id-ID');
+  UDP_STATS.recentLogs.unshift(`[${time}] ${msg}`);
+  if (UDP_STATS.recentLogs.length > 60) UDP_STATS.recentLogs.pop();
+}
+
+// ==========================================
+// 3. DNS RESOLVER
+// ==========================================
 async function resolveDomain(hostname) {
   const now = Date.now();
   const cached = dnsCache.get(hostname);
@@ -194,12 +220,9 @@ function parseTlsSni(buffer) {
     if (buffer[0] !== 0x16) return null;
     let pos = 43;
     if (pos >= buffer.length) return null;
-    const sessionIdLen = buffer[pos];
-    pos += 1 + sessionIdLen;
-    const cipherSuitesLen = buffer.readUInt16BE(pos);
-    pos += 2 + cipherSuitesLen;
-    const compMethodsLen = buffer[pos];
-    pos += 1 + compMethodsLen;
+    pos += 1 + buffer[pos];
+    pos += 2 + buffer.readUInt16BE(pos);
+    pos += 1 + buffer[pos];
     if (pos >= buffer.length) return null;
     const extensionsLen = buffer.readUInt16BE(pos);
     pos += 2;
@@ -221,6 +244,12 @@ function parseTlsSni(buffer) {
   return null;
 }
 
+function parseRequestBody(raw) {
+  const delimiterIndex = raw.indexOf('\r\n\r\n');
+  if (delimiterIndex === -1) return {};
+  try { return JSON.parse(raw.slice(delimiterIndex + 4)); } catch (_) { return {}; }
+}
+
 function formatBytesToGB(bytes) {
   if (!bytes || bytes === 0) return '0.000 GB';
   return (bytes / (1024 * 1024 * 1024)).toFixed(3) + ' GB';
@@ -235,36 +264,8 @@ function formatBytes(bytes) {
 }
 
 // ==========================================
-// 3. UDP RELAY / XUDP CORE
+// 4. UDP RELAY (XUDP PROTOCOL ENGINE)
 // ==========================================
-const UDP_CONFIG = Object.freeze({
-  LISTEN_HOST: '0.0.0.0',
-  WS_PATH: '/',
-  MAX_WS_MESSAGE_BYTES: 4 * 1024 * 1024,
-  HANDSHAKE_TIMEOUT_MS: 10000,
-  IDLE_TIMEOUT_MS: 300000,
-  XUDP_GRACE_MS: 60000,
-  MAX_CONNECTIONS: 4096,
-  REJECT_UDP_443: false,
-});
-
-const UDP_STATS = {
-  startTime: Date.now(),
-  activeClients: 0,
-  totalHandshakes: 0,
-  udpPacketsOut: 0,
-  udpBytesOut: 0,
-  udpPacketsIn: 0,
-  udpBytesIn: 0,
-  recentLogs: [],
-};
-
-function addLog(msg) {
-  const time = new Date().toLocaleTimeString('id-ID');
-  UDP_STATS.recentLogs.unshift(`[${time}] ${msg}`);
-  if (UDP_STATS.recentLogs.length > 60) UDP_STATS.recentLogs.pop();
-}
-
 const RELAY_MAGIC = Buffer.from('VLRLY004', 'ascii');
 const RELAY_MODE_FIXED_UDP = 0x01;
 const RELAY_MODE_MUX = 0x02;
@@ -401,7 +402,7 @@ function parseEndpointBytes(buffer, offset) {
     const len = buffer[cursor++];
     if (len === 0 || buffer.length - cursor < len) throw new Error('invalid domain length');
     let host;
-    try { host = utf8Fatal.decode(buffer.subarray(cursor, cursor + len)); } catch { throw new Error('invalid UTF-8 domain'); }
+    try { host = utf8Fatal.decode(buffer.subarray(cursor, cursor + len)); } catch { throw new Error('invalid domain length'); }
     return { endpoint: { host, port, atyp }, next: cursor + len };
   }
   if (atyp === ATYP_IPV6) {
@@ -549,7 +550,7 @@ class UDPAssociation {
     return false;
   }
   async send(target, payload) {
-    if (this.closed) throw new Error('UDP association is closed');
+    if (this.closed) throw new Error('UDP association closed');
     if (payload.length > MAX_PACKET_LEN) throw new Error(`UDP payload too large: ${payload.length}`);
     const resolved = await resolveTargetUDP(target);
     const socket = resolved.family === 6 ? this.udp6 : this.udp4;
@@ -730,7 +731,7 @@ class MuxSession {
     this.closed = false;
   }
   async sendUDP(target, payload) {
-    if (!this.udp) throw new Error('UDP session is unavailable');
+    if (!this.udp) throw new Error('UDP session unavailable');
     await this.udp.send(target, payload);
   }
   closeWithoutRemoving() {
@@ -1120,32 +1121,9 @@ class WebSocketRelaySocket extends EventEmitter {
   }
 }
 
-function acceptWebSocketUpgrade(req, raw) {
-  const upgrade = String(req.headers.upgrade || '').toLowerCase();
-  const connection = String(req.headers.connection || '').toLowerCase();
-  const key = String(req.headers['sec-websocket-key'] || '');
-  const version = String(req.headers['sec-websocket-version'] || '');
-  if (upgrade !== 'websocket' || !connection.split(',').some((v) => v.trim() === 'upgrade') || version !== '13') {
-    raw.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
-    return null;
-  }
-  let keyBytes;
-  try { keyBytes = Buffer.from(key, 'base64'); } catch { keyBytes = Buffer.alloc(0); }
-  if (keyBytes.length !== 16) {
-    raw.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
-    return null;
-  }
-  const accept = websocketAccept(key);
-  raw.write(
-    'HTTP/1.1 101 Switching Protocols\r\n' +
-    'Upgrade: websocket\r\n' +
-    'Connection: Upgrade\r\n' +
-    `Sec-WebSocket-Accept: ${accept}\r\n\r\n`
-  );
-  return new WebSocketRelaySocket(raw, UDP_CONFIG.MAX_WS_MESSAGE_BYTES);
-}
+const xm = new XUDPManager(UDP_CONFIG.XUDP_GRACE_MS);
 
-async function handleConnectionUDP(socket, cfg, xm) {
+async function handleConnectionUDP(socket, cfg) {
   const reader = new AsyncByteReader(socket);
   let established = false;
   socket.setNoDelay(true);
@@ -1153,7 +1131,7 @@ async function handleConnectionUDP(socket, cfg, xm) {
   try {
     const control = await readControl(reader);
     established = true;
-    addLog(`[OK] Handshake Valid | Mode: 0x${control.mode.toString(16)} | IP: ${socket.remoteAddress || 'Worker'}`);
+    addUdpLog(`[OK] Handshake Valid | Mode: 0x${control.mode.toString(16)} | IP: ${socket.remoteAddress || 'Worker'}`);
     socket.setTimeout(cfg.IDLE_TIMEOUT_MS > 0 ? cfg.IDLE_TIMEOUT_MS : 0, () => socket.destroy(new Error('idle timeout')));
     if (control.mode === RELAY_MODE_FIXED_UDP) await serveDirectUDP(socket, reader, control.target);
     else if (control.mode === RELAY_MODE_PACKET_UDP) await servePacketUDP(socket, reader);
@@ -1163,8 +1141,8 @@ async function handleConnectionUDP(socket, cfg, xm) {
     }
   } catch (err) {
     if (!established && !socket.destroyed) {
-      addLog(`[WARN] Handshake Gagal: malformed header`);
-      await writeControlError(socket, 'malformed control header');
+      addUdpLog(`[WARN] Handshake UDP Gagal`);
+      await writeControlError(socket, 'malformed header');
     }
   } finally {
     socket.destroy();
@@ -1172,9 +1150,9 @@ async function handleConnectionUDP(socket, cfg, xm) {
 }
 
 // ==========================================
-// 4. UNIFIED DASHBOARD HTML
+// 5. DASHBOARD UI BUILDER
 // ==========================================
-function renderMasterDashboardHTML() {
+function renderDashboardHTML() {
   return `<!DOCTYPE html>
 <html lang="id">
 <head>
@@ -1211,7 +1189,7 @@ function renderMasterDashboardHTML() {
 </head>
 <body>
   <div class="card">
-    <h2>⚡ DUAL SYSTEM CONTROLLER</h2>
+    <h2>⚡ DUAL SERVICE CONTROLLER</h2>
 
     <!-- ENDPOINT 1: UDP RELAY -->
     <div class="endpoint-box" style="border-color:#38bdf8;">
@@ -1225,13 +1203,13 @@ function renderMasterDashboardHTML() {
     <!-- ENDPOINT 2: TCP PROXY -->
     <div class="endpoint-box" style="border-color:#a855f7;">
       <div>
-        <div class="endpoint-title" style="color:#c084fc;">🛠️ Multi-Proxy Endpoint (TCP Port ${PROXY_PORT})</div>
+        <div class="endpoint-title" style="color:#c084fc;">🛠️ Multi-Proxy Endpoint (TCP Port)</div>
         <div class="endpoint-val" style="color:#c084fc;" id="proxy_tcp_url">${PROXY_SERVER_INFO.fullProxy || 'Loading...'}</div>
       </div>
       <button class="btn-copy" style="border-color:#c084fc; color:#c084fc;" onclick="navigator.clipboard.writeText(document.getElementById('proxy_tcp_url').innerText)">📋 SALIN</button>
     </div>
 
-    <!-- USAGE STATS IN GB -->
+    <!-- METRICS IN GB -->
     <div class="badge-grid">
       <div class="badge" style="border-color:#38bdf8;">
         <h4>UDP In / Recv</h4>
@@ -1261,7 +1239,7 @@ function renderMasterDashboardHTML() {
         <div class="val" style="color:#39ff14;" id="combined_active">0 / 0</div>
       </div>
       <div class="badge">
-        <h4>DNS Resolver Mode</h4>
+        <h4>DNS Resolver Status</h4>
         <div class="val" style="color:#38bdf8; font-size:0.95rem;" id="badge_dns_mode">${DNS_CONFIG.mode}</div>
       </div>
     </div>
@@ -1328,7 +1306,7 @@ function renderMasterDashboardHTML() {
     </div>
 
     <!-- LIVE CONNECTIONS -->
-    <div class="section-title">🟢 ACTIVE PROXY CONNECTIONS (PORT ${PROXY_PORT})</div>
+    <div class="section-title">🟢 LIVE CONNECTIONS (REAL-TIME)</div>
     <div class="conn-list" id="proxy_conn_container"></div>
   </div>
 
@@ -1472,326 +1450,373 @@ function renderMasterDashboardHTML() {
 </html>`;
 }
 
-function parseJsonBody(req) {
-  return new Promise((resolve) => {
-    let body = '';
-    req.on('data', c => { body += c; });
-    req.on('end', () => {
-      try { resolve(JSON.parse(body)); } catch { resolve({}); }
+// ==========================================
+// 6. CORE MULTIPLEXER (NET SOCKET HANDLER)
+// ==========================================
+function setupConnectionHandler(clientSocket) {
+  clientSocket.setNoDelay(true);
+  clientSocket.setKeepAlive(true, 5000);
+  clientSocket.setMaxListeners(0);
+
+  const connId = ++connectionIdCounter;
+  const rawIp = clientSocket.remoteAddress || 'Unknown';
+  const clientIp = rawIp.replace('::ffff:', '');
+  const startTime = Date.now();
+
+  const connData = {
+    id: connId,
+    clientIp,
+    type: 'INITIALIZING',
+    target: 'pending',
+    startTime,
+    bytesIn: 0,
+    bytesOut: 0
+  };
+
+  let isFirstPacket = true;
+  let targetSocket = null;
+  let socksState = 0;
+  let httpBuffer = '';
+
+  const bridgeSockets = (sockA, sockB) => {
+    sockA.on('data', (d) => {
+      connData.bytesIn += d.length;
+      proxyBytesIn += d.length;
     });
-  });
-}
+    sockB.on('data', (d) => {
+      connData.bytesOut += d.length;
+      proxyBytesOut += d.length;
+    });
 
-// ==========================================
-// 5. SERVER 1: PORT 8080 (HTTP / WS / UI / API)
-// ==========================================
-function startPort8080Server() {
-  const xm = new XUDPManager(UDP_CONFIG.XUDP_GRACE_MS);
-  let active = 0;
+    sockA.pipe(sockB, { end: true });
+    sockB.pipe(sockA, { end: true });
 
-  const server = http.createServer(async (req, res) => {
-    const parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-    const pathname = parsedUrl.pathname;
+    const cleanup = () => {
+      activeConnections.delete(connId);
+      sockA.destroy();
+      sockB.destroy();
+    };
 
-    // API Stats
-    if (pathname === '/api/stats') {
-      const activeList = Array.from(activeConnections.values()).map(c => ({
-        id: c.id,
-        clientIp: c.clientIp,
-        type: c.type,
-        target: c.target,
-        uptime: Math.floor((Date.now() - c.startTime) / 1000),
-        bytesIn: formatBytes(c.bytesIn),
-        bytesOut: formatBytes(c.bytesOut)
-      }));
+    sockA.on('error', cleanup);
+    sockB.on('error', cleanup);
+    sockA.on('close', cleanup);
+    sockB.on('close', cleanup);
+  };
 
-      const userObjects = [];
-      proxyUsers.forEach((pass, user) => userObjects.push({ username: user, password: pass }));
+  const handleSocks5 = async (chunk) => {
+    if (socksState === 0) {
+      const nmethods = chunk[1];
+      const methods = chunk.slice(2, 2 + nmethods);
+      const requiresAuth = (PROXY_AUTH_MODE === 'AUTH' && proxyUsers.size > 0);
 
-      const payload = {
-        udp: {
-          activeClients: UDP_STATS.activeClients,
-          totalHandshakes: UDP_STATS.totalHandshakes,
-          packetsIn: UDP_STATS.udpPacketsIn,
-          packetsOut: UDP_STATS.udpPacketsOut,
-          bytesInGB: formatBytesToGB(UDP_STATS.udpBytesIn),
-          bytesOutGB: formatBytesToGB(UDP_STATS.udpBytesOut),
-          recentLogs: UDP_STATS.recentLogs
-        },
-        proxy: {
-          totalActive: activeList.length,
-          bytesInGB: formatBytesToGB(proxyBytesIn),
-          bytesOutGB: formatBytesToGB(proxyBytesOut),
-          info: PROXY_SERVER_INFO,
-          userList: userObjects,
-          authMode: PROXY_AUTH_MODE,
-          rawTcpConfig: RAW_TCP_CONFIG,
-          dnsConfig: DNS_CONFIG,
-          connections: activeList
+      if (requiresAuth) {
+        if (!methods.includes(0x02)) {
+          clientSocket.write(Buffer.from([0x05, 0xFF]));
+          return clientSocket.end();
         }
-      };
-
-      res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
-      return res.end(JSON.stringify(payload));
-    }
-
-    // API: Set DNS Proxy
-    if (pathname === '/api/set-dns' && req.method === 'POST') {
-      const body = await parseJsonBody(req);
-      if (body.preset && PRESETS[body.preset]) {
-        const p = PRESETS[body.preset];
-        DNS_CONFIG.mode = p.type;
-        DNS_CONFIG.activeName = p.name;
-        if (p.type === 'DOH') DNS_CONFIG.dohUrl = p.url;
-        else { DNS_CONFIG.udpServer = p.host; DNS_CONFIG.udpPort = p.port; }
-      } else if (body.mode === 'DOH') {
-        DNS_CONFIG.mode = 'DOH';
-        DNS_CONFIG.activeName = 'Custom DoH';
-        DNS_CONFIG.dohUrl = body.dohUrl || 'https://cloudflare-dns.com/dns-query';
-      } else if (body.mode === 'UDP') {
-        DNS_CONFIG.mode = 'UDP';
-        DNS_CONFIG.activeName = 'Custom UDP';
-        DNS_CONFIG.udpServer = body.udpServer || '1.1.1.1';
-        DNS_CONFIG.udpPort = parseInt(body.udpPort, 10) || 53;
+        socksState = 1;
+        clientSocket.write(Buffer.from([0x05, 0x02]));
+      } else {
+        socksState = 2;
+        clientSocket.write(Buffer.from([0x05, 0x00]));
       }
-      saveData();
-      dnsCache.clear();
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ success: true, config: DNS_CONFIG }));
-    }
-
-    // API: Set RAW TCP Proxy
-    if (pathname === '/api/set-raw-tcp' && req.method === 'POST') {
-      const body = await parseJsonBody(req);
-      RAW_TCP_CONFIG.enabled = !!body.enabled;
-      if (body.defaultTargetHost) RAW_TCP_CONFIG.defaultTargetHost = body.defaultTargetHost.trim();
-      if (body.defaultTargetPort) RAW_TCP_CONFIG.defaultTargetPort = parseInt(body.defaultTargetPort, 10) || 443;
-      saveData();
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ success: true, config: RAW_TCP_CONFIG }));
-    }
-
-    // API: Manage Users Proxy
-    if (pathname === '/api/manage-users' && req.method === 'POST') {
-      const body = await parseJsonBody(req);
-      if (body.action === 'add' && body.username && body.password) {
-        proxyUsers.set(body.username.trim(), body.password.trim());
-        saveData();
-      } else if (body.action === 'delete' && body.username) {
-        proxyUsers.delete(body.username);
-        saveData();
-      } else if (body.action === 'set-mode' && body.mode) {
-        PROXY_AUTH_MODE = body.mode;
-        saveData();
-      }
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ success: true }));
-    }
-
-    // Serve UI
-    if (pathname === '/' || pathname === '/index.html') {
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      return res.end(renderMasterDashboardHTML());
-    }
-
-    res.writeHead(404, { 'Content-Type': 'text/plain' });
-    res.end('Not Found');
-  });
-
-  // Upgrade WebSocket untuk UDP Relay
-  server.on('upgrade', (req, raw) => {
-    UDP_STATS.totalHandshakes++;
-    if (active >= UDP_CONFIG.MAX_CONNECTIONS) {
-      raw.end('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n');
       return;
     }
-    const ws = acceptWebSocketUpgrade(req, raw);
-    if (!ws) return;
 
-    active++;
-    UDP_STATS.activeClients = active;
-    let counted = true;
-    ws.once('close', () => {
-      if (counted) {
-        counted = false;
-        active--;
-        UDP_STATS.activeClients = active;
-        addLog(`[DISCONNECT] Klien terputus. Sisa: ${active}`);
+    if (socksState === 1) {
+      if (chunk[0] !== 0x01) return clientSocket.end();
+      const uLen = chunk[1];
+      const username = chunk.slice(2, 2 + uLen).toString('utf-8');
+      const pLen = chunk[2 + uLen];
+      const password = chunk.slice(3 + uLen, 3 + uLen + pLen).toString('utf-8');
+
+      if (proxyUsers.has(username) && proxyUsers.get(username) === password) {
+        socksState = 2;
+        clientSocket.write(Buffer.from([0x01, 0x00]));
+      } else {
+        clientSocket.write(Buffer.from([0x01, 0x01]));
+        return clientSocket.end();
       }
-    });
+      return;
+    }
 
-    handleConnectionUDP(ws, UDP_CONFIG, xm).catch(() => ws.destroy());
-  });
+    if (socksState === 2) {
+      if (chunk[0] !== 0x05 || chunk[1] !== 0x01) {
+        clientSocket.write(Buffer.from([0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
+        return clientSocket.end();
+      }
 
-  server.on('error', (err) => {
-    console.error(`[Fatal UDP/UI Server Error on Port ${UDP_PORT}]:`, err.message);
-    process.exit(1);
-  });
+      let targetHost = '';
+      let targetPort = 0;
+      const atyp = chunk[3];
 
-  server.listen(UDP_PORT, '0.0.0.0', () => {
-    console.log(`[UDP Relay & UI] Berjalan di port ${UDP_PORT}`);
-    addLog(`UDP Relay & Web UI listening di port ${UDP_PORT}`);
-  });
-}
+      if (atyp === 0x01) {
+        targetHost = `${chunk[4]}.${chunk[5]}.${chunk[6]}.${chunk[7]}`;
+        targetPort = chunk.readUInt16BE(8);
+      } else if (atyp === 0x03) {
+        const dLen = chunk[4];
+        targetHost = chunk.slice(5, 5 + dLen).toString('utf-8');
+        targetPort = chunk.readUInt16BE(5 + dLen);
+      } else {
+        clientSocket.write(Buffer.from([0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
+        return clientSocket.end();
+      }
 
-// ==========================================
-// 6. SERVER 2: PORT 8081 (MULTI-PROTOCOL PROXY ENGINE)
-// ==========================================
-function startPort8081Proxy() {
-  const proxyServer = net.createServer({
-    noDelay: true,
-    allowHalfOpen: false
-  }, (clientSocket) => {
-    clientSocket.setNoDelay(true);
-    clientSocket.setKeepAlive(true, 5000);
+      connData.type = 'SOCKS5';
+      connData.target = `${targetHost}:${targetPort}`;
+      activeConnections.set(connId, connData);
 
-    const connId = ++connectionIdCounter;
-    const clientIp = (clientSocket.remoteAddress || 'Unknown').replace('::ffff:', '');
-    const connData = {
-      id: connId,
-      clientIp,
-      type: 'INITIALIZING',
-      target: 'pending',
-      startTime: Date.now(),
-      bytesIn: 0,
-      bytesOut: 0
-    };
+      try {
+        const resolvedIp = await resolveDomain(targetHost);
+        targetSocket = net.connect({ host: resolvedIp, port: targetPort, noDelay: true }, () => {
+          targetSocket.setNoDelay(true);
+          targetSocket.setKeepAlive(true, 5000);
+          clientSocket.write(Buffer.from([0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0x10, 0x10]));
+          clientSocket.removeAllListeners('data');
+          bridgeSockets(clientSocket, targetSocket);
+        });
 
-    let isFirstPacket = true;
-    let targetSocket = null;
-    let socksState = 0;
-    let httpBuffer = '';
+        targetSocket.on('error', () => {
+          activeConnections.delete(connId);
+          clientSocket.destroy();
+        });
+      } catch (err) {
+        clientSocket.write(Buffer.from([0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
+        clientSocket.end();
+      }
+    }
+  };
 
-    const bridgeSockets = (sockA, sockB) => {
-      sockA.on('data', (d) => {
-        connData.bytesIn += d.length;
-        proxyBytesIn += d.length;
-      });
-      sockB.on('data', (d) => {
-        connData.bytesOut += d.length;
-        proxyBytesOut += d.length;
-      });
+  clientSocket.on('data', async (chunk) => {
+    if (socksState > 0) return handleSocks5(chunk);
 
-      sockA.pipe(sockB, { end: true });
-      sockB.pipe(sockA, { end: true });
+    if (isFirstPacket) {
+      if (chunk[0] === 0x05) {
+        isFirstPacket = false;
+        return handleSocks5(chunk);
+      }
 
-      const cleanup = () => {
-        activeConnections.delete(connId);
-        sockA.destroy();
-        sockB.destroy();
-      };
-      sockA.on('error', cleanup);
-      sockB.on('error', cleanup);
-      sockA.on('close', cleanup);
-      sockB.on('close', cleanup);
-    };
+      const chunkStr = chunk.toString('utf-8');
 
-    // SOCKS5 Handler
-    const handleSocks5 = async (chunk) => {
-      if (socksState === 0) {
-        const nmethods = chunk[1];
-        const methods = chunk.slice(2, 2 + nmethods);
-        const requiresAuth = (PROXY_AUTH_MODE === 'AUTH' && proxyUsers.size > 0);
+      // 1. HTTP REQUEST / DASHBOARD / API / WEBSOCKET UPGRADE
+      if (/^(GET|POST|PUT|DELETE|OPTIONS|HEAD)\s/i.test(chunkStr)) {
+        httpBuffer += chunkStr;
 
-        if (requiresAuth) {
-          if (!methods.includes(0x02)) {
-            clientSocket.write(Buffer.from([0x05, 0xFF]));
-            return clientSocket.end();
+        const contentLenMatch = httpBuffer.match(/Content-Length:\s*(\d+)/i);
+        const headerEnd = httpBuffer.indexOf('\r\n\r\n');
+        
+        if (contentLenMatch && headerEnd !== -1) {
+          const expectedLen = parseInt(contentLenMatch[1], 10);
+          const bodyLen = Buffer.byteLength(httpBuffer.slice(headerEnd + 4));
+          if (bodyLen < expectedLen) return;
+        } else if (headerEnd === -1 && httpBuffer.startsWith('POST')) {
+          return;
+        }
+
+        isFirstPacket = false;
+        const dataStr = httpBuffer;
+        const firstLine = dataStr.split('\r\n')[0];
+        const pathUrl = firstLine.split(' ')[1] || '/';
+
+        // CEK WEBSOCKET UPGRADE (UNTUK UDP RELAY)
+        if (/Upgrade:\s*websocket/i.test(dataStr)) {
+          const keyMatch = dataStr.match(/Sec-WebSocket-Key:\s*([^\r\n]+)/i);
+          if (keyMatch) {
+            const key = keyMatch[1].trim();
+            const accept = websocketAccept(key);
+            clientSocket.write(
+              'HTTP/1.1 101 Switching Protocols\r\n' +
+              'Upgrade: websocket\r\n' +
+              'Connection: Upgrade\r\n' +
+              `Sec-WebSocket-Accept: ${accept}\r\n\r\n`
+            );
+
+            UDP_STATS.totalHandshakes++;
+            UDP_STATS.activeClients++;
+            let counted = true;
+
+            const ws = new WebSocketRelaySocket(clientSocket, UDP_CONFIG.MAX_WS_MESSAGE_BYTES);
+            ws.once('close', () => {
+              if (counted) {
+                counted = false;
+                UDP_STATS.activeClients--;
+                addUdpLog(`[DISCONNECT] Klien terputus. Sisa: ${UDP_STATS.activeClients}`);
+              }
+            });
+
+            // Sisa buffer jika ada
+            const rest = Buffer.from(httpBuffer.slice(headerEnd + 4));
+            if (rest.length > 0) ws.feedHead(rest);
+
+            handleConnectionUDP(ws, UDP_CONFIG).catch(() => ws.destroy());
+            return;
           }
-          socksState = 1;
-          clientSocket.write(Buffer.from([0x05, 0x02]));
-        } else {
-          socksState = 2;
-          clientSocket.write(Buffer.from([0x05, 0x00]));
         }
-        return;
-      }
 
-      if (socksState === 1) {
-        if (chunk[0] !== 0x01) return clientSocket.end();
-        const uLen = chunk[1];
-        const username = chunk.slice(2, 2 + uLen).toString('utf-8');
-        const pLen = chunk[2 + uLen];
-        const password = chunk.slice(3 + uLen, 3 + uLen + pLen).toString('utf-8');
+        // API: Set DNS
+        if (pathUrl.startsWith('/api/set-dns') && dataStr.startsWith('POST')) {
+          try {
+            const body = parseRequestBody(dataStr);
+            if (body.preset && PRESETS[body.preset]) {
+              const p = PRESETS[body.preset];
+              DNS_CONFIG.mode = p.type;
+              DNS_CONFIG.activeName = p.name;
+              if (p.type === 'DOH') DNS_CONFIG.dohUrl = p.url;
+              else { DNS_CONFIG.udpServer = p.host; DNS_CONFIG.udpPort = p.port; }
+            } else if (body.mode === 'DOH') {
+              DNS_CONFIG.mode = 'DOH';
+              DNS_CONFIG.activeName = 'Custom DoH';
+              DNS_CONFIG.dohUrl = body.dohUrl || 'https://cloudflare-dns.com/dns-query';
+            } else if (body.mode === 'UDP') {
+              DNS_CONFIG.mode = 'UDP';
+              DNS_CONFIG.activeName = 'Custom UDP';
+              DNS_CONFIG.udpServer = body.udpServer || '1.1.1.1';
+              DNS_CONFIG.udpPort = parseInt(body.udpPort, 10) || 53;
+            }
+            saveData();
+            dnsCache.clear();
+            const resBody = JSON.stringify({ success: true, config: DNS_CONFIG });
+            clientSocket.write(`HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${resBody.length}\r\nConnection: close\r\n\r\n${resBody}`);
+          } catch (e) {
+            const errBody = JSON.stringify({ success: false, error: e.message });
+            clientSocket.write(`HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: ${errBody.length}\r\nConnection: close\r\n\r\n${errBody}`);
+          }
+          clientSocket.end();
+          return;
+        }
 
-        if (proxyUsers.has(username) && proxyUsers.get(username) === password) {
-          socksState = 2;
-          clientSocket.write(Buffer.from([0x01, 0x00]));
-        } else {
-          clientSocket.write(Buffer.from([0x01, 0x01]));
+        // API: Set RAW TCP
+        if (pathUrl === '/api/set-raw-tcp' && dataStr.startsWith('POST')) {
+          const body = parseRequestBody(dataStr);
+          RAW_TCP_CONFIG.enabled = !!body.enabled;
+          if (body.defaultTargetHost) RAW_TCP_CONFIG.defaultTargetHost = body.defaultTargetHost.trim();
+          if (body.defaultTargetPort) RAW_TCP_CONFIG.defaultTargetPort = parseInt(body.defaultTargetPort, 10) || 443;
+          saveData();
+          const resBody = JSON.stringify({ success: true, config: RAW_TCP_CONFIG });
+          clientSocket.write(`HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${resBody.length}\r\nConnection: close\r\n\r\n${resBody}`);
+          clientSocket.end();
+          return;
+        }
+
+        // API: Manage Users
+        if (pathUrl === '/api/manage-users' && dataStr.startsWith('POST')) {
+          const body = parseRequestBody(dataStr);
+          if (body.action === 'add' && body.username && body.password) {
+            proxyUsers.set(body.username.trim(), body.password.trim());
+            saveData();
+          } else if (body.action === 'delete' && body.username) {
+            proxyUsers.delete(body.username);
+            saveData();
+          } else if (body.action === 'set-mode' && body.mode) {
+            PROXY_AUTH_MODE = body.mode;
+            saveData();
+          }
+          const resBody = JSON.stringify({ success: true });
+          clientSocket.write(`HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${resBody.length}\r\nConnection: close\r\n\r\n${resBody}`);
+          clientSocket.end();
+          return;
+        }
+
+        // API: Unified Realtime Stats
+        if (pathUrl === '/api/stats') {
+          const activeList = Array.from(activeConnections.values())
+            .filter(c => !c.target.includes('railway.com') && !c.target.includes('up.railway.app'))
+            .map(c => ({
+              id: c.id,
+              clientIp: c.clientIp,
+              type: c.type,
+              target: c.target,
+              uptime: Math.floor((Date.now() - c.startTime) / 1000),
+              bytesIn: formatBytes(c.bytesIn),
+              bytesOut: formatBytes(c.bytesOut)
+            }));
+
+          const userObjects = [];
+          proxyUsers.forEach((pass, user) => userObjects.push({ username: user, password: pass }));
+
+          const resBody = JSON.stringify({
+            udp: {
+              activeClients: UDP_STATS.activeClients,
+              totalHandshakes: UDP_STATS.totalHandshakes,
+              packetsIn: UDP_STATS.udpPacketsIn,
+              packetsOut: UDP_STATS.udpPacketsOut,
+              bytesInGB: formatBytesToGB(UDP_STATS.udpBytesIn),
+              bytesOutGB: formatBytesToGB(UDP_STATS.udpBytesOut),
+              recentLogs: UDP_STATS.recentLogs
+            },
+            proxy: {
+              info: PROXY_SERVER_INFO,
+              dnsConfig: DNS_CONFIG,
+              rawTcpConfig: RAW_TCP_CONFIG,
+              authMode: PROXY_AUTH_MODE,
+              userList: userObjects,
+              totalActive: activeList.length,
+              bytesInGB: formatBytesToGB(proxyBytesIn),
+              bytesOutGB: formatBytesToGB(proxyBytesOut),
+              connections: activeList
+            }
+          });
+
+          clientSocket.write(`HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: ${Buffer.byteLength(resBody)}\r\nConnection: close\r\n\r\n${resBody}`);
+          clientSocket.end();
+          return;
+        }
+
+        // DASHBOARD WEB UI: Layani jika path root ATAU jika request datang dari Railway Domain/Localhost
+        const hostHeaderMatch = dataStr.match(/Host:\s*([^\r\n:]+)/i);
+        const reqHost = hostHeaderMatch ? hostHeaderMatch[1].trim() : '';
+        const isInternalHost = reqHost.includes('railway.app') || reqHost.includes('railway.com') || reqHost.includes('localhost') || reqHost.includes('127.0.0.1');
+
+        if (pathUrl === '/' || pathUrl === '/index.html' || isInternalHost) {
+          const html = renderDashboardHTML();
+          clientSocket.write(`HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: ${Buffer.byteLength(html)}\r\nConnection: close\r\n\r\n${html}`);
+          clientSocket.end();
+          return;
+        }
+
+        // HTTP Forward Proxy biasa
+        if (!checkHttpAuth(dataStr)) {
+          const authReq = 'HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="Proxy Auth"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n';
+          clientSocket.write(authReq);
           return clientSocket.end();
         }
-        return;
-      }
 
-      if (socksState === 2) {
-        if (chunk[0] !== 0x05 || chunk[1] !== 0x01) {
-          clientSocket.write(Buffer.from([0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
-          return clientSocket.end();
-        }
+        const hostMatch = dataStr.match(/Host:\s*([^\r\n:]+)(?::(\d+))?/i);
+        const targetHost = hostMatch ? hostMatch[1].trim() : 'speed.cloudflare.com';
+        const targetPort = hostMatch && hostMatch[2] ? parseInt(hostMatch[2], 10) : 80;
 
-        let targetHost = '';
-        let targetPort = 0;
-        const atyp = chunk[3];
-        if (atyp === 0x01) {
-          targetHost = `${chunk[4]}.${chunk[5]}.${chunk[6]}.${chunk[7]}`;
-          targetPort = chunk.readUInt16BE(8);
-        } else if (atyp === 0x03) {
-          const dLen = chunk[4];
-          targetHost = chunk.slice(5, 5 + dLen).toString('utf-8');
-          targetPort = chunk.readUInt16BE(5 + dLen);
-        } else {
-          clientSocket.write(Buffer.from([0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
-          return clientSocket.end();
-        }
-
-        connData.type = 'SOCKS5';
+        connData.type = 'HTTP SCAN';
         connData.target = `${targetHost}:${targetPort}`;
         activeConnections.set(connId, connData);
 
-        try {
-          const resolvedIp = await resolveDomain(targetHost);
-          targetSocket = net.connect({ host: resolvedIp, port: targetPort, noDelay: true }, () => {
-            targetSocket.setNoDelay(true);
-            targetSocket.setKeepAlive(true, 5000);
-            clientSocket.write(Buffer.from([0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0x10, 0x10]));
-            clientSocket.removeAllListeners('data');
-            bridgeSockets(clientSocket, targetSocket);
-          });
-          targetSocket.on('error', () => { activeConnections.delete(connId); clientSocket.destroy(); });
-        } catch {
-          clientSocket.write(Buffer.from([0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
-          clientSocket.end();
-        }
+        const resolvedIp = await resolveDomain(targetHost);
+        targetSocket = net.connect({ host: resolvedIp, port: targetPort, noDelay: true }, () => {
+          targetSocket.setNoDelay(true);
+          targetSocket.setKeepAlive(true, 5000);
+          targetSocket.write(Buffer.from(httpBuffer));
+          bridgeSockets(clientSocket, targetSocket);
+        });
+
+        targetSocket.on('error', () => { activeConnections.delete(connId); clientSocket.destroy(); });
+        return;
       }
-    };
 
-    clientSocket.on('data', async (chunk) => {
-      if (socksState > 0) return handleSocks5(chunk);
+      isFirstPacket = false;
 
-      if (isFirstPacket) {
-        if (chunk[0] === 0x05) {
-          isFirstPacket = false;
-          return handleSocks5(chunk);
+      // 2. HTTPS CONNECT PROXY
+      if (chunkStr.startsWith('CONNECT ')) {
+        if (!checkHttpAuth(chunkStr)) {
+          const authReq = 'HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="Proxy Auth"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n';
+          clientSocket.write(authReq);
+          return clientSocket.end();
         }
 
-        const chunkStr = chunk.toString('utf-8');
+        const match = chunkStr.match(/CONNECT\s+([^:\s]+):(\d+)/i);
+        if (match) {
+          const targetHost = match[1];
+          const targetPort = parseInt(match[2], 10) || 443;
 
-        // HTTP Forward Proxy
-        if (/^(GET|POST|PUT|DELETE|OPTIONS|HEAD)\s/i.test(chunkStr)) {
-          httpBuffer += chunkStr;
-          isFirstPacket = false;
-
-          if (!checkHttpAuth(httpBuffer)) {
-            clientSocket.write('HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="Proxy Auth"\r\n\r\n');
-            return clientSocket.end();
-          }
-
-          const hostMatch = httpBuffer.match(/Host:\s*([^\r\n:]+)(?::(\d+))?/i);
-          const targetHost = hostMatch ? hostMatch[1].trim() : 'speed.cloudflare.com';
-          const targetPort = hostMatch && hostMatch[2] ? parseInt(hostMatch[2], 10) : 80;
-
-          connData.type = 'HTTP SCAN';
+          connData.type = 'HTTPS TUNNEL';
           connData.target = `${targetHost}:${targetPort}`;
           activeConnections.set(connId, connData);
 
@@ -1799,92 +1824,81 @@ function startPort8081Proxy() {
           targetSocket = net.connect({ host: resolvedIp, port: targetPort, noDelay: true }, () => {
             targetSocket.setNoDelay(true);
             targetSocket.setKeepAlive(true, 5000);
-            targetSocket.write(Buffer.from(httpBuffer));
+            clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
             bridgeSockets(clientSocket, targetSocket);
           });
+
           targetSocket.on('error', () => { activeConnections.delete(connId); clientSocket.destroy(); });
           return;
         }
-
-        isFirstPacket = false;
-
-        // HTTPS CONNECT Proxy
-        if (chunkStr.startsWith('CONNECT ')) {
-          if (!checkHttpAuth(chunkStr)) {
-            clientSocket.write('HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="Proxy Auth"\r\n\r\n');
-            return clientSocket.end();
-          }
-
-          const match = chunkStr.match(/CONNECT\s+([^:\s]+):(\d+)/i);
-          if (match) {
-            const targetHost = match[1];
-            const targetPort = parseInt(match[2], 10) || 443;
-            connData.type = 'HTTPS TUNNEL';
-            connData.target = `${targetHost}:${targetPort}`;
-            activeConnections.set(connId, connData);
-
-            const resolvedIp = await resolveDomain(targetHost);
-            targetSocket = net.connect({ host: resolvedIp, port: targetPort, noDelay: true }, () => {
-              targetSocket.setNoDelay(true);
-              targetSocket.setKeepAlive(true, 5000);
-              clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-              bridgeSockets(clientSocket, targetSocket);
-            });
-            targetSocket.on('error', () => { activeConnections.delete(connId); clientSocket.destroy(); });
-            return;
-          }
-        }
-
-        // RAW TCP / VLESS / TROJAN / SNI ROUTER
-        const sni = parseTlsSni(chunk);
-        let destinationHost = '';
-        let destinationPort = 443;
-
-        if (sni) {
-          destinationHost = sni;
-          connData.type = 'VLESS/TLS (SNI)';
-        } else if (RAW_TCP_CONFIG.enabled) {
-          destinationHost = RAW_TCP_CONFIG.defaultTargetHost;
-          destinationPort = RAW_TCP_CONFIG.defaultTargetPort;
-          connData.type = 'RAW TCP MENTAH';
-        } else {
-          destinationHost = 'speed.cloudflare.com';
-          connData.type = 'DIRECT FALLBACK';
-        }
-
-        connData.target = `${destinationHost}:${destinationPort}`;
-        activeConnections.set(connId, connData);
-
-        const resolvedIp = await resolveDomain(destinationHost);
-        targetSocket = net.connect({ host: resolvedIp, port: destinationPort, noDelay: true }, () => {
-          targetSocket.setNoDelay(true);
-          targetSocket.setKeepAlive(true, 5000);
-          targetSocket.write(chunk);
-          bridgeSockets(clientSocket, targetSocket);
-        });
-        targetSocket.on('error', () => { activeConnections.delete(connId); clientSocket.destroy(); });
       }
-    });
 
-    const cleanOnExit = () => {
-      activeConnections.delete(connId);
-      if (targetSocket) targetSocket.destroy();
-    };
-    clientSocket.on('error', cleanOnExit);
-    clientSocket.on('close', cleanOnExit);
+      // 3. RAW TCP / VLESS / TROJAN / SNI ROUTER
+      const sni = parseTlsSni(chunk);
+      let destinationHost = '';
+      let destinationPort = 443;
+
+      if (sni) {
+        destinationHost = sni;
+        connData.type = 'VLESS/TLS (SNI)';
+      } else if (RAW_TCP_CONFIG.enabled) {
+        destinationHost = RAW_TCP_CONFIG.defaultTargetHost;
+        destinationPort = RAW_TCP_CONFIG.defaultTargetPort;
+        connData.type = 'RAW TCP MENTAH';
+      } else {
+        destinationHost = 'speed.cloudflare.com';
+        connData.type = 'DIRECT FALLBACK';
+      }
+
+      connData.target = `${destinationHost}:${destinationPort}`;
+      activeConnections.set(connId, connData);
+
+      const resolvedIp = await resolveDomain(destinationHost);
+      targetSocket = net.connect({ host: resolvedIp, port: destinationPort, noDelay: true }, () => {
+        targetSocket.setNoDelay(true);
+        targetSocket.setKeepAlive(true, 5000);
+        targetSocket.write(chunk);
+        bridgeSockets(clientSocket, targetSocket);
+      });
+
+      targetSocket.on('error', () => { activeConnections.delete(connId); clientSocket.destroy(); });
+    }
   });
 
-  proxyServer.on('error', (err) => {
-    console.error(`[Fatal TCP Proxy Error on Port ${PROXY_PORT}]:`, err.message);
-  });
-
-  proxyServer.listen(PROXY_PORT, '0.0.0.0', () => {
-    console.log(`[Proxy Server] TCP Engine berjalan di port ${PROXY_PORT}`);
-  });
+  clientSocket.on('error', () => { activeConnections.delete(connId); if (targetSocket) targetSocket.destroy(); });
+  clientSocket.on('close', () => { activeConnections.delete(connId); if (targetSocket) targetSocket.destroy(); });
 }
 
 // ==========================================
-// 7. INITIALIZE BOTH SERVERS
+// 7. START LISTENERS (PORT 8080 & PORT 8081)
 // ==========================================
-startPort8080Server();
-startPort8081Proxy();
+// Server Utama (Port 8080 - Handle Railway HTTP, UI, UDP Relay WS, & Multi Proxy)
+const mainServer = net.createServer({
+  noDelay: true,
+  allowHalfOpen: false,
+  pauseOnConnect: false
+}, setupConnectionHandler);
+
+mainServer.on('error', (err) => {
+  console.error(`[Main Server Error on Port ${MAIN_PORT}]:`, err.message);
+});
+
+mainServer.listen(MAIN_PORT, '0.0.0.0', () => {
+  console.log(`[Unified Server] Berjalan di port ${MAIN_PORT}`);
+  addUdpLog(`Unified Server running on port ${MAIN_PORT}`);
+});
+
+// Server Cadangan (Port 8081 - Khusus Forwarding TCP Proxy Railway jika diarahkan ke 8081)
+const extraTcpServer = net.createServer({
+  noDelay: true,
+  allowHalfOpen: false,
+  pauseOnConnect: false
+}, setupConnectionHandler);
+
+extraTcpServer.on('error', (err) => {
+  console.error(`[Extra TCP Server Error on Port ${EXTRA_TCP_PORT}]:`, err.message);
+});
+
+extraTcpServer.listen(EXTRA_TCP_PORT, '0.0.0.0', () => {
+  console.log(`[Extra TCP Server] Berjalan di port ${EXTRA_TCP_PORT}`);
+});
